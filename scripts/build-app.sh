@@ -4,18 +4,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if swift build -c release --arch arm64 --arch x86_64 2>/dev/null; then
-  BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path 2>/dev/null)/T3Bar"
-else
-  swift build -c release
-  BIN="$(swift build -c release --show-bin-path 2>/dev/null)/T3Bar"
-fi
-[[ -x "$BIN" ]] || { echo "Built binary not found: $BIN" >&2; exit 1; }
+TMPDIR_BUILD=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_BUILD"' EXIT
 
 APP=build/T3Bar.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/T3Bar"
+
+if swift build -c release --arch arm64 \
+   && cp "$(swift build -c release --arch arm64 --show-bin-path)/T3Bar" "$TMPDIR_BUILD/T3Bar-arm64" \
+   && swift build -c release --arch x86_64 \
+   && cp "$(swift build -c release --arch x86_64 --show-bin-path)/T3Bar" "$TMPDIR_BUILD/T3Bar-x86_64"; then
+  lipo -create "$TMPDIR_BUILD/T3Bar-arm64" "$TMPDIR_BUILD/T3Bar-x86_64" -output "$APP/Contents/MacOS/T3Bar"
+else
+  swift build -c release
+  BIN="$(swift build -c release --show-bin-path)/T3Bar"
+  cp "$BIN" "$APP/Contents/MacOS/T3Bar"
+fi
+
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
 if [[ -n "${VERSION:-}" ]]; then
@@ -27,9 +33,7 @@ fi
 
 # App icon from assets/icon.svg (needs rsvg-convert; skipped otherwise).
 if command -v rsvg-convert >/dev/null; then
-  TMPICON=$(mktemp -d)
-  trap 'rm -rf "$TMPICON"' EXIT
-  ICONSET="$TMPICON/AppIcon.iconset"
+  ICONSET="$TMPDIR_BUILD/AppIcon.iconset"
   mkdir -p "$ICONSET"
   for size in 16 32 128 256 512; do
     rsvg-convert -w $size -h $size assets/icon.svg -o "$ICONSET/icon_${size}x${size}.png"
