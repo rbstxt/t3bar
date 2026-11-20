@@ -1,5 +1,3 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
-
 # T3Bar
 
 T3 Code が把握している各 AI プロバイダーの使用量の上限（Session / Weekly / Monthly）を、macOS のメニューバーに表示するアプリです。T3 Code の **Usage → Limits** 画面と同じデータを、軽量な常駐メニューバー項目として手元で確認できます。
