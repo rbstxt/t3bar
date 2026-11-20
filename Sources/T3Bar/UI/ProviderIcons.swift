@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 /// Provider logos as NSImages, decoded once from the SVGs in ProviderIconData.
 @MainActor
@@ -33,22 +32,5 @@ enum ProviderIcons {
         let scale = min(box.width / size.width, box.height / size.height)
         let w = size.width * scale, h = size.height * scale
         return NSRect(x: box.midX - w / 2, y: box.midY - h / 2, width: w, height: h)
-    }
-}
-
-/// A provider's logo in its own colors, following light and dark mode.
-struct ProviderLogo: View {
-    let driver: String
-    var size: CGFloat = 14
-    @Environment(\.colorScheme) private var scheme
-
-    var body: some View {
-        if let image = ProviderIcons.image(driver, scheme == .dark ? .dark : .light) {
-            Image(nsImage: image)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: size, height: size)
-        }
     }
 }

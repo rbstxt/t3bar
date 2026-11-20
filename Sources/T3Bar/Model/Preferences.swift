@@ -1,10 +1,9 @@
-import Combine
 import Foundation
 import ServiceManagement
 
 /// The handful of choices T3Bar offers, stored in UserDefaults.
 @MainActor
-final class Preferences: ObservableObject {
+final class Preferences {
     static let automatic = "auto"
 
     /// Remaining-percent levels that turn numbers orange (warn) and red (critical).
@@ -18,46 +17,68 @@ final class Preferences: ObservableObject {
         var label: String { "残り \(warn)%・\(critical)%" }
     }
 
+    private let observers = Observers()
+    private let defaults = UserDefaults.standard
+
     /// `auto` follows whichever limit is closest to running out; otherwise a provider driver.
-    @Published var menuBarProvider: String {
-        didSet { defaults.set(menuBarProvider, forKey: "menuBarProvider") }
-    }
-
-    /// Show the provider's logo in the menu bar, so "auto" says which provider it follows.
-    @Published var showsProviderIcon: Bool {
-        didSet { defaults.set(showsProviderIcon, forKey: "showsProviderIcon") }
-    }
-
-    /// Show the two small gauges (first two windows) in the menu bar.
-    @Published var showsGauge: Bool {
-        didSet { defaults.set(showsGauge, forKey: "showsGauge") }
-    }
-
-    @Published var showsPercent: Bool {
-        didSet { defaults.set(showsPercent, forKey: "showsPercent") }
-    }
-
-    /// Tint the menu bar number when a limit runs low.
-    @Published var colorsWhenLow: Bool {
-        didSet { defaults.set(colorsWhenLow, forKey: "colorsWhenLow") }
-    }
-
-    /// Also tint it when the shown provider is on course to run out before a reset.
-    @Published var colorsOnForecast: Bool {
-        didSet { defaults.set(colorsOnForecast, forKey: "colorsOnForecast") }
-    }
-
-    /// Where orange and red begin, in the menu bar and the popover alike.
-    @Published var levels: Levels {
+    var menuBarProvider: String {
         didSet {
-            defaults.set(levels.warn, forKey: "warnLevel")
-            Theme.levels = levels
+            defaults.set(menuBarProvider, forKey: "menuBarProvider")
+            if oldValue != menuBarProvider { observers.notify() }
         }
     }
 
-    @Published private(set) var launchesAtLogin: Bool
+    /// Show the provider's logo in the menu bar, so "auto" says which provider it follows.
+    var showsProviderIcon: Bool {
+        didSet {
+            defaults.set(showsProviderIcon, forKey: "showsProviderIcon")
+            if oldValue != showsProviderIcon { observers.notify() }
+        }
+    }
 
-    private let defaults = UserDefaults.standard
+    /// Show the two small gauges (first two windows) in the menu bar.
+    var showsGauge: Bool {
+        didSet {
+            defaults.set(showsGauge, forKey: "showsGauge")
+            if oldValue != showsGauge { observers.notify() }
+        }
+    }
+
+    var showsPercent: Bool {
+        didSet {
+            defaults.set(showsPercent, forKey: "showsPercent")
+            if oldValue != showsPercent { observers.notify() }
+        }
+    }
+
+    /// Tint the menu bar number when a limit runs low.
+    var colorsWhenLow: Bool {
+        didSet {
+            defaults.set(colorsWhenLow, forKey: "colorsWhenLow")
+            if oldValue != colorsWhenLow { observers.notify() }
+        }
+    }
+
+    /// Also tint it when the shown provider is on course to run out before a reset.
+    var colorsOnForecast: Bool {
+        didSet {
+            defaults.set(colorsOnForecast, forKey: "colorsOnForecast")
+            if oldValue != colorsOnForecast { observers.notify() }
+        }
+    }
+
+    /// Where orange and red begin, in the menu bar and the popover alike.
+    var levels: Levels {
+        didSet {
+            defaults.set(levels.warn, forKey: "warnLevel")
+            Theme.levels = levels
+            if oldValue != levels { observers.notify() }
+        }
+    }
+
+    private(set) var launchesAtLogin: Bool {
+        didSet { if oldValue != launchesAtLogin { observers.notify() } }
+    }
 
     init() {
         menuBarProvider = defaults.string(forKey: "menuBarProvider") ?? Self.automatic
@@ -71,6 +92,13 @@ final class Preferences: ObservableObject {
         launchesAtLogin = SMAppService.mainApp.status == .enabled
         Theme.levels = levels
     }
+
+    func observe(_ handler: @escaping () -> Void) -> ObserverToken {
+        observers.add(handler)
+    }
+
+    /// Test seam: how many observers are currently attached.
+    var observerCount: Int { observers.count }
 
     func setLaunchesAtLogin(_ on: Bool) {
         do {

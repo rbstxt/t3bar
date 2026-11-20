@@ -34,7 +34,9 @@ final class T3Client {
     private var nextRequestId = 1
     private var subscriptionId: String?
     private var refreshId: String?
-    private var retryDelay: TimeInterval = 1
+    /// Retry pacing; a stopped server gets its own slower ladder so a sleeping
+    /// Mac is not polled hard, while rare errors recover quickly.
+    private var backoff = RetryBackoff()
     private var retryTask: Task<Void, Never>?
     private var pingTimer: Timer?
     private var isConnected = false
@@ -51,8 +53,20 @@ final class T3Client {
     func start() { connect() }
 
     func reconnect() {
-        retryDelay = 1
+        resetBackoff()
         connect()
+    }
+
+    /// The delay after which a stopped server is tried again: 3, 6, 12, 24,
+    /// 48, then a minute each time, so a sleeping Mac is not polled hard.
+    nonisolated static func nextServerDownDelay(_ current: TimeInterval) -> TimeInterval {
+        RetryBackoff.nextServerDown(current)
+    }
+
+    private func resetBackoff() {
+        backoff.reset()
+        retryTask?.cancel()
+        retryTask = nil
     }
 
     /// Asks the server to probe providers again; the new limits arrive on the stream.
@@ -180,7 +194,9 @@ final class T3Client {
 
     private func markConnected(_ socket: URLSessionWebSocketTask) {
         isConnected = true
-        retryDelay = 1
+        backoff.reset()
+        retryTask?.cancel()
+        retryTask = nil
         onState(.connected)
         pingTimer?.invalidate()
         let gen = generation
@@ -211,22 +227,24 @@ final class T3Client {
         switch failure {
         case .serverDown:
             onState(.serverDown)
-            scheduleRetry(after: 3, maxDelay: 3)
+            let delay = backoff.delayForServerDown()
+            scheduleRetry(after: delay, maxDelay: 60)
         case .auth(let message):
             onState(.authFailed(message))
-            scheduleRetry(after: retryDelay, maxDelay: 120)
+            let delay = backoff.delayForFailure(cap: 120)
+            scheduleRetry(after: delay, maxDelay: 120)
         case .incompatible:
             onState(.incompatible)
             scheduleRetry(after: 300, maxDelay: 300)
         case .other(let message):
             onState(ServerLocator.origin() == nil ? .serverDown : .failed(message))
-            scheduleRetry(after: retryDelay, maxDelay: 30)
+            let delay = backoff.delayForFailure(cap: 30)
+            scheduleRetry(after: delay, maxDelay: 30)
         }
     }
 
     private func scheduleRetry(after delay: TimeInterval, maxDelay: TimeInterval) {
         let wait = min(delay, maxDelay)
-        retryDelay = min(max(retryDelay, 1) * 2, maxDelay)
         let gen = generation
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
@@ -311,5 +329,35 @@ final class T3Client {
             return String(text.prefix(160))
         }
         return nil
+    }
+}
+
+/// Retry pacing: a stopped server walks 3, 6, 12, 24, 48, then 60 seconds;
+/// other failures double from 1 s to their cap. A fresh connection (or a wake)
+/// calls `reset()`, which is why the ladders live in one testable value.
+struct RetryBackoff: Equatable {
+    private(set) var general: TimeInterval = 1
+    private(set) var serverDown: TimeInterval = 3
+
+    static func nextServerDown(_ current: TimeInterval) -> TimeInterval {
+        current >= 60 ? 60 : min(current * 2, 60)
+    }
+
+    mutating func reset() {
+        self = RetryBackoff()
+    }
+
+    /// Returns the delay to use now, then advances the server-down ladder.
+    mutating func delayForServerDown() -> TimeInterval {
+        let delay = serverDown
+        serverDown = Self.nextServerDown(serverDown)
+        return delay
+    }
+
+    /// Returns the delay to use now, then doubles the general ladder up to `cap`.
+    mutating func delayForFailure(cap: TimeInterval) -> TimeInterval {
+        let delay = min(general, cap)
+        general = min(max(general, 1) * 2, cap)
+        return delay
     }
 }

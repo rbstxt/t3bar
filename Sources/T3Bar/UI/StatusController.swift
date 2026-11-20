@@ -1,6 +1,28 @@
 import AppKit
-import Combine
-import SwiftUI
+
+/// The color the menu bar number should get, kept semantic so it compares
+/// cleanly before the attributed title is rebuilt.
+enum MenuBarTone: Equatable {
+    case normal, warning, critical
+}
+
+/// Everything `render` would put on the item. Compared field by field so an
+/// unchanged attribute is not written again, and the icon is only redrawn when
+/// its drawing inputs (logo, gauges, bar values) actually change.
+struct MenuBarItemSnapshot: Equatable {
+    struct ImageInput: Equatable {
+        var logoDriver: String?
+        var bars: [Int]
+        var gauges: Bool
+    }
+
+    var image: ImageInput?
+    var title: String
+    var tone: MenuBarTone
+    var isDisabled: Bool
+    var accessibilityLabel: String
+    var tooltip: String
+}
 
 /// Owns the menu bar item and its popover.
 @MainActor
@@ -9,7 +31,9 @@ final class StatusController: NSObject, NSPopoverDelegate {
     private let prefs: Preferences
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
-    private var subscriptions = Set<AnyCancellable>()
+    private var tokens: [ObserverToken] = []
+    private var popoverController: PopoverViewController?
+    private var lastSnapshot: MenuBarItemSnapshot?
 
     init(store: UsageStore, prefs: Preferences) {
         self.store = store
@@ -21,6 +45,10 @@ final class StatusController: NSObject, NSPopoverDelegate {
         popover.animates = true
         popover.delegate = self
 
+        // Read the system's increase-contrast setting on the main thread and
+        // keep the cache the colour provider reads up to date.
+        Theme.startTrackingHighContrast()
+
         if let button = item.button {
             button.target = self
             button.action = #selector(clicked(_:))
@@ -29,12 +57,19 @@ final class StatusController: NSObject, NSPopoverDelegate {
             button.imageHugsTitle = true
         }
 
-        // objectWillChange fires before the change; hopping to the next run loop reads the new values.
-        store.objectWillChange.merge(with: prefs.objectWillChange)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.render() }
-            .store(in: &subscriptions)
+        tokens = [
+            store.observe { [weak self] in self?.render() },
+            prefs.observe { [weak self] in self?.render() },
+        ]
         render()
+    }
+
+    deinit {
+        // `deinit` is nonisolated; the controller is owned by the main actor,
+        // so releasing its observer tokens here is safe.
+        MainActor.assumeIsolated {
+            for token in tokens { token.cancel() }
+        }
     }
 
     // MARK: Menu bar
@@ -51,64 +86,135 @@ final class StatusController: NSObject, NSPopoverDelegate {
             .min { $0.1.remainingPercent < $1.1.remainingPercent }
     }
 
+    private func makeSnapshot() -> MenuBarItemSnapshot {
+        guard let selection = shownSelection() else {
+            return MenuBarItemSnapshot(
+                image: nil,
+                title: "",
+                tone: .normal,
+                isDisabled: store.connection != .live,
+                accessibilityLabel: "T3Bar",
+                tooltip: tooltip(nil))
+        }
+
+        let logoDriver = prefs.showsProviderIcon && ProviderIcons.has(selection.group.driver)
+            ? selection.group.driver : nil
+        let bars = selection.group.windows.prefix(2).map(\.remainingPercent)
+        let gauges = prefs.showsGauge
+        let imageIsNil = logoDriver == nil && !gauges
+
+        let remaining = selection.window.remainingPercent
+        var text = ""
+        // A provider without a logo keeps its name, so the number is never anonymous.
+        if prefs.showsProviderIcon, logoDriver == nil { text = selection.group.name }
+        // With everything turned off, still show the number rather than an empty item.
+        if prefs.showsPercent || (imageIsNil && text.isEmpty) {
+            text += (text.isEmpty ? "" : " ") + "\(remaining)%"
+        }
+        let lead = imageIsNil || text.isEmpty ? "" : " "
+
+        // A forecast means some window in the shown provider runs out before its reset.
+        let onForecast = selection.group.windows.contains { $0.emptiesAt != nil }
+        let tone = Self.tone(remaining: remaining, onForecast: onForecast,
+                             colorsWhenLow: prefs.colorsWhenLow, colorsOnForecast: prefs.colorsOnForecast)
+
+        return MenuBarItemSnapshot(
+            image: MenuBarItemSnapshot.ImageInput(logoDriver: logoDriver, bars: bars, gauges: gauges),
+            title: lead + text,
+            tone: tone,
+            isDisabled: store.connection != .live,
+            accessibilityLabel: "\(selection.group.name) \(selection.window.label) 残り \(remaining)%",
+            tooltip: tooltip(selection))
+    }
+
+    /// The color the menu bar number gets: red at `Theme.levels.critical`,
+    /// orange at `warn` (the boundary counts as low) or when a window is
+    /// forecast to run out before its reset, and no color when the user turned
+    /// the feature off. Pure and internal, so the rules are directly testable.
+    static func tone(remaining: Int, onForecast: Bool,
+                     colorsWhenLow: Bool, colorsOnForecast: Bool) -> MenuBarTone {
+        guard colorsWhenLow else { return .normal }
+        if remaining <= Theme.levels.critical { return .critical }
+        if remaining <= Theme.levels.warn { return .warning }
+        if colorsOnForecast && onForecast { return .warning }
+        return .normal
+    }
+
     private func render() {
         guard let button = item.button else { return }
-        let selection = shownSelection()
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let snapshot = makeSnapshot()
+        let previous = lastSnapshot
 
-        if let selection {
-            let bars = selection.group.windows.prefix(2).map { Double($0.remainingPercent) / 100 }
-            let logo = prefs.showsProviderIcon ? ProviderIcons.image(selection.group.driver, .template) : nil
-            let image = MenuBarIcon.image(remaining: bars, logo: logo, gauges: prefs.showsGauge)
-            button.image = image
-            let remaining = selection.window.remainingPercent
-            var text = ""
-            // A provider without a logo keeps its name, so the number is never anonymous.
-            if prefs.showsProviderIcon, logo == nil { text = selection.group.name }
-            // With everything turned off, still show the number rather than an empty item.
-            if prefs.showsPercent || (image == nil && text.isEmpty) {
-                text += (text.isEmpty ? "" : " ") + "\(remaining)%"
-            }
+        if snapshot.image != previous?.image {
+            button.image = image(for: snapshot.image)
+        }
+
+        if snapshot.title != previous?.title || snapshot.tone != previous?.tone {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             var attributes: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: 0.5]
-            if prefs.colorsWhenLow {
-                let forecast = prefs.colorsOnForecast && selection.group.windows.contains { $0.emptiesAt != nil }
-                if let color = Theme.alert(remaining) ?? (forecast ? .systemOrange : nil) {
-                    attributes[.foregroundColor] = color
+            switch snapshot.tone {
+            case .normal: break
+            case .warning: attributes[.foregroundColor] = NSColor.systemOrange
+            case .critical: attributes[.foregroundColor] = NSColor.systemRed
+            }
+            button.attributedTitle = NSAttributedString(string: snapshot.title, attributes: attributes)
+        }
+
+        if snapshot.isDisabled != previous?.isDisabled {
+            button.appearsDisabled = snapshot.isDisabled
+        }
+        if snapshot.accessibilityLabel != previous?.accessibilityLabel {
+            button.setAccessibilityLabel(snapshot.accessibilityLabel)
+        }
+        if snapshot.tooltip != previous?.tooltip {
+            button.toolTip = snapshot.tooltip
+        }
+
+        lastSnapshot = snapshot
+    }
+
+    private func image(for input: MenuBarItemSnapshot.ImageInput?) -> NSImage? {
+        guard let input else { return MenuBarIcon.image(remaining: []) }
+        let logo = input.logoDriver.flatMap { ProviderIcons.image($0, .template) }
+        return MenuBarIcon.image(remaining: input.bars.map { Double($0) / 100 }, logo: logo, gauges: input.gauges)
+    }
+
+    /// The usage lines shared by the menu bar tooltip. Pure, so the 0% reset
+    /// wording is directly testable without a status item.
+    static func usageTooltipLines(group: DriverGroup, shown: WindowGroup, now: Date) -> [String] {
+        var windows = Array(group.windows.prefix(2))
+        if !windows.contains(where: { $0.id == shown.id }) { windows.append(shown) }
+        var lines = [group.name]
+        for w in windows {
+            let pooled = w.members.count > 1
+            var line = "\(w.label) \(pooled ? "平均" : "")\(w.remainingPercent)%"
+            if let reset = w.nextReset { line += "  ↻\(Format.countdown(to: reset, now: now))" }
+            for m in w.members {
+                let prefix = pooled ? m.account.initials + " " : ""
+                if let zero = Depletion.note(remaining: m.remainingPercent,
+                                             reset: m.resetsAt, now: now) {
+                    line += "  \(prefix)\(zero.short)"
+                } else if let empties = m.emptiesAt {
+                    line += "  \(prefix)\(Format.countdown(to: empties, now: now))で枯渇"
                 }
             }
-            let lead = image == nil || text.isEmpty ? "" : " "
-            button.attributedTitle = NSAttributedString(string: lead + text, attributes: attributes)
-        } else {
-            button.image = MenuBarIcon.image(remaining: [])
-            button.attributedTitle = NSAttributedString(string: "")
+            lines.append(line)
         }
-        button.appearsDisabled = store.connection != .live
-        button.toolTip = tooltip(selection)
-        button.setAccessibilityLabel(selection.map {
-            "\($0.group.name) \($0.window.label) 残り \($0.window.remainingPercent)%"
-        } ?? "T3Bar")
+        return lines
     }
 
     /// Only what the menu bar shows: the provider, then its gauge windows (and the
     /// window behind the number, if that is not one of them), one line each.
+    ///
+    /// The countdown text is a snapshot: the tooltip is rebuilt only when the
+    /// store (new numbers) or the preferences notify, or when the item is
+    /// rendered for another reason. There is no dedicated tooltip timer, so a
+    /// hover can be a few tens of seconds stale between pushes.
     private func tooltip(_ selection: (group: DriverGroup, window: WindowGroup)?) -> String {
-        var lines: [String] = []
-        if let (group, shown) = selection {
-            let now = Date()
-            var windows = Array(group.windows.prefix(2))
-            if !windows.contains(where: { $0.id == shown.id }) { windows.append(shown) }
-            lines.append(group.name)
-            for w in windows {
-                let pooled = w.members.count > 1
-                var line = "\(w.label) \(pooled ? "平均" : "")\(w.remainingPercent)%"
-                if let reset = w.nextReset { line += "  ↻\(Format.countdown(to: reset, now: now))" }
-                for m in w.members {
-                    guard let empties = m.emptiesAt else { continue }
-                    line += "  \(pooled ? m.account.initials + " " : "")\(Format.countdown(to: empties, now: now))で枯渇"
-                }
-                lines.append(line)
-            }
-        }
+        let now = Date()
+        var lines = selection.map {
+            Self.usageTooltipLines(group: $0.group, shown: $0.window, now: now)
+        } ?? []
         if store.connection != .live { lines.append(UsageStore.Connection.statusLabel(store.connection)) }
         return lines.isEmpty ? "T3Bar" : lines.joined(separator: "\n")
     }
@@ -133,18 +239,26 @@ final class StatusController: NSObject, NSPopoverDelegate {
 
     func showPopover() {
         guard !popover.isShown, let button = item.button else { return }
-        let view = PopoverView(store: store, prefs: prefs, openT3: { [weak self] in self?.openT3() },
-                               quit: { NSApp.terminate(nil) })
-        let controller = NSHostingController(rootView: view)
-        controller.sizingOptions = [.preferredContentSize]
+        let controller = PopoverViewController(
+            store: store, prefs: prefs,
+            openT3: { [weak self] in self?.openT3() },
+            quit: { NSApp.terminate(nil) })
+        controller.onSizeChange = { [weak self] size in self?.popover.contentSize = size }
         popover.contentViewController = controller
+        popoverController = controller
+        controller.loadViewIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+        // The single start path: the controller owns the popover lifecycle, so
+        // it attaches the feeds here instead of also doing it in viewDidAppear.
+        controller.startUpdates()
     }
 
     func popoverDidClose(_ notification: Notification) {
         // Drop the view tree while closed; the menu bar needs nothing from it.
+        popoverController?.stopUpdates()
+        popoverController = nil
         popover.contentViewController = nil
     }
 

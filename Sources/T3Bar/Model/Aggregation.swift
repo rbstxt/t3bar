@@ -9,6 +9,41 @@ enum Pace: Equatable {
     case ahead, onTrack, under
 }
 
+/// What to say about a window whose displayed remainder has reached zero.
+/// A rounded 0% is a spent limit, not a pace: it must never fall through to
+/// the "速め" note, so the reset countdown takes priority over `emptiesAt`.
+enum Depletion {
+    struct Note: Equatable {
+        /// Card text: "20mでリセット", "まもなくリセット", "上限到達・更新待ち".
+        var text: String
+        /// One-line menu bar form: "上限到達・20mでリセット".
+        var short: String
+        /// Hover help, with the absolute reset moment when one is known.
+        var help: String
+    }
+
+    /// Nil while any remainder is left, so 1% and up keep their existing notes.
+    static func note(remaining: Int, reset: Date?, now: Date) -> Note? {
+        guard remaining <= 0 else { return nil }
+        guard let reset else {
+            return Note(text: "上限到達", short: "上限到達",
+                        help: "上限に到達。リセット時刻は報告されていません")
+        }
+        let seconds = reset.timeIntervalSince(now)
+        guard seconds > 0 else {
+            return Note(text: "上限到達・更新待ち", short: "上限到達・更新待ち",
+                        help: "報告されたリセット時刻を過ぎています。新しい使用量の取得を待っています")
+        }
+        if seconds < 60 {
+            return Note(text: "まもなくリセット", short: "上限到達・まもなくリセット",
+                        help: "上限に到達。まもなくリセットされます（\(Format.moment(reset))）")
+        }
+        let countdown = Format.countdown(to: reset, now: now)
+        return Note(text: "\(countdown)でリセット", short: "上限到達・\(countdown)でリセット",
+                    help: "上限に到達。\(Format.moment(reset)) にリセット（あと \(countdown)）")
+    }
+}
+
 struct AccountBadge: Equatable {
     var key: String
     var name: String

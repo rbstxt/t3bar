@@ -1,9 +1,8 @@
-import Combine
 import Foundation
 
 /// Holds the latest limits from T3 Code and what the menu bar and popover show.
 @MainActor
-final class UsageStore: ObservableObject {
+final class UsageStore {
     enum Connection: Equatable {
         case connecting
         case live
@@ -13,28 +12,52 @@ final class UsageStore: ObservableObject {
         case failed(String)
     }
 
-    @Published private(set) var groups: [DriverGroup] = []
-    @Published private(set) var connection: Connection = .connecting
-    @Published private(set) var updatedAt: Date?
-    @Published private(set) var isRefreshing = false
+    private(set) var groups: [DriverGroup] = [] {
+        didSet { if oldValue != groups { observers.notify() } }
+    }
+    private(set) var connection: Connection = .connecting {
+        didSet { if oldValue != connection { observers.notify() } }
+    }
+    private(set) var updatedAt: Date? {
+        didSet { if oldValue != updatedAt { observers.notify() } }
+    }
+    private(set) var isRefreshing = false {
+        didSet { if oldValue != isRefreshing { observers.notify() } }
+    }
 
+    private let observers = Observers()
     private var providers: [ProviderStatus] = []
     private var sources: [HubSource] = []
     private let client = T3Client()
     private var clock: Timer?
 
-    init() {
+    /// The default initializer connects to the local server. Tests pass an
+    /// initial state so they can exercise the banner and empty-state paths.
+    init(groups: [DriverGroup] = [], connection: Connection = .connecting) {
+        self.groups = groups
+        self.connection = connection
         client.onState = { [weak self] state in self?.apply(state) }
         client.onEvent = { [weak self] event in self?.apply(event) }
         client.onRefreshFinished = { [weak self] in self?.isRefreshing = false }
     }
 
+    /// Multiple views (menu bar, popover) can listen at once; the token removes it.
+    func observe(_ handler: @escaping () -> Void) -> ObserverToken {
+        observers.add(handler)
+    }
+
+    /// Test seam: how many observers are currently attached.
+    var observerCount: Int { observers.count }
+
     func start() {
         client.start()
         // Pace and session/weekly interplay depend on the time, so recompute now and then.
-        clock = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.rebuild() }
         }
+        timer.tolerance = 6
+        RunLoop.main.add(timer, forMode: .common)
+        clock = timer
     }
 
     func refresh() {
@@ -57,7 +80,8 @@ final class UsageStore: ObservableObject {
 
     // MARK: -
 
-    private func apply(_ state: T3Client.State) {
+    /// Applies a connection state. Internal so tests can drive transitions.
+    func apply(_ state: T3Client.State) {
         switch state {
         case .connecting: if connection != .live { connection = .connecting }
         case .connected: connection = .live
@@ -68,7 +92,8 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    private func apply(_ event: [String: Any]) {
+    /// Merges a server event. Internal so tests can feed snapshots.
+    func apply(_ event: [String: Any]) {
         let payload = event["payload"] as? [String: Any]
         switch event["type"] as? String {
         case "snapshot":
