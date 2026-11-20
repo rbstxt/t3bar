@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install librsvg for AppIcon generation
+        run: brew install librsvg
+
+      - name: Run tests
+        run: swift test
+
+      - name: Determine release version
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package universal .zip and .dmg (ad-hoc signed)
+        run: |
+          chmod +x scripts/build-app.sh scripts/package-release.sh
+          ./scripts/package-release.sh "${{ steps.meta.outputs.version }}"
+
+      - name: Verify no SwiftUI or Combine direct links
+        run: |
+          if otool -L -arch all build/T3Bar.app/Contents/MacOS/T3Bar | grep -Ei 'SwiftUI|Combine'; then
+            echo "Unexpected SwiftUI/Combine linkage found" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          OUT="build/release"
+          ZIP="$OUT/T3Bar-${VERSION}-macos-universal.zip"
+          DMG="$OUT/T3Bar-${VERSION}-macos-universal.dmg"
+          SUMS="$OUT/SHA256SUMS.txt"
+
+          NOTES=$(cat <<EOF
+          ## Install
+
+          ### Homebrew (recommended)
+          \`\`\`sh
+          brew install --cask --no-quarantine rbstxt/tap/t3bar
+          \`\`\`
+
+          ### Direct Download
+          Download \`T3Bar-${VERSION}-macos-universal.dmg\` (or \`.zip\`), move \`T3Bar.app\` to \`/Applications\`, and if macOS Gatekeeper blocks the first launch (ad-hoc signed build), run:
+          \`\`\`sh
+          xattr -dr com.apple.quarantine /Applications/T3Bar.app
+          \`\`\`
+
+          ## SHA-256
+          \`\`\`
+          $(cat "$SUMS")
+          \`\`\`
+          EOF
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" "$ZIP" "$SUMS" --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$DMG" "$ZIP" "$SUMS" \
+              --title "T3Bar $TAG" \
+              --notes "$NOTES" \
+              --generate-notes
+          fi
+
+      - name: Update Homebrew tap (optional, requires HOMEBREW_TAP_TOKEN secret)
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          SHA256="$(awk '/\.zip$/ { print $1 }' build/release/SHA256SUMS.txt)"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/rbstxt/homebrew-tap.git" /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sed -i '' -E "s/^  version \".*\"/  version \"${VERSION}\"/" Casks/t3bar.rb
+          sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"${SHA256}\"/" Casks/t3bar.rb
+          if ! git diff --quiet; then
+            git add Casks/t3bar.rb
+            git commit -m "t3bar ${VERSION}"
+            git push
+          fi

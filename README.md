@@ -13,7 +13,34 @@ T3 Code が把握している各 AI プロバイダーの使用量の上限（Se
 
 ## インストール / ビルド
 
-動作には macOS 14 以降、Swift 6 ツールチェーン（Xcode または Command Line Tools）、およびローカルで動作する T3 Code が必要です。
+動作には macOS 14（Sonoma）以降と、ローカルで動作する T3 Code が必要です。配布バイナリは Universal Binary（Apple Silicon / Intel 両対応）で、ad-hoc 署名されています。
+
+### Homebrew（おすすめ）
+
+```sh
+brew install --cask --no-quarantine rbstxt/tap/t3bar
+```
+
+アップデート・アンインストール:
+
+```sh
+brew upgrade --cask --no-quarantine rbstxt/tap/t3bar
+brew uninstall --cask t3bar
+```
+
+### GitHub Releases からダウンロード
+
+[GitHub Releases](https://github.com/rbstxt/t3bar/releases/latest) から `T3Bar-<version>-macos-universal.dmg`（または `.zip`）をダウンロードし、`T3Bar.app` を `/Applications` へ配置してください。
+
+ad-hoc 署名のため、初回起動時に macOS の Gatekeeper にブロックされた場合は以下を実行してください:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/T3Bar.app
+```
+
+### ソースからビルド
+
+ソースビルドには Swift 6 ツールチェーン（Xcode または Command Line Tools）が必要です。
 
 ```sh
 ./scripts/build-app.sh            # build/T3Bar.app をビルド（Universal Binary）
