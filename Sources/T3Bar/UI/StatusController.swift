@@ -151,7 +151,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
 
         if snapshot.title != previous?.title || snapshot.tone != previous?.tone {
             let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-            var attributes: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: 0.5]
+            var attributes: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: -0.5]
             switch snapshot.tone {
             case .normal: break
             case .warning: attributes[.foregroundColor] = NSColor.systemOrange
